@@ -156,7 +156,7 @@ class SubscribeEpisodeGuard(_PluginBase):
     # 插件图标
     plugin_icon = "subscribe.png"
     # 插件版本
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     # 插件作者
     plugin_author = "totobo"
     # 作者主页
@@ -169,7 +169,7 @@ class SubscribeEpisodeGuard(_PluginBase):
     autostart = True
 
     # 运行参数（__init__ 中给默认值，__update_config 刷新）
-    _enabled = True
+    _enabled = False
     _mode = "observe"
     _grace_days = 14
     _recent_ep_days = 21
@@ -190,7 +190,7 @@ class SubscribeEpisodeGuard(_PluginBase):
 
     def __update_config(self, config: Dict[str, Any]):
         """更新配置：官方 '已保存' 事件模式，配置变化即生效。"""
-        self._enabled = config.get("enabled") is not False
+        self._enabled = bool(config.get("enabled"))
         self._mode = config.get("enabled_mode") or "observe"
         try:
             self._grace_days = max(1, int(config.get("grace_days") or 14))
@@ -661,7 +661,7 @@ class SubscribeEpisodeGuard(_PluginBase):
                 ]
             }
         ], {
-            "enabled": True,
+            "enabled": False,
             "enabled_mode": "observe",
             "intervention": "veto",
             "grace_days": 14,
