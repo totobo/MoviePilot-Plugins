@@ -114,37 +114,66 @@ def is_premature_completion(*,
                             series_first_air_date: Optional[datetime.date] = None,
                             now: Optional[datetime.datetime] = None,
                             grace_days: int = 14,
-                            recent_ep_days: int = 21) -> Tuple[bool, str]:
+                            recent_ep_days: int = 21) -> Tuple[bool, str, Dict[str, Any]]:
     """
     是否疑似"过早完成"。全部条件满足才 True；任一不满足保守放行结项。
     media_type 与 Subscribe.type 存值一致，电视剧为 '电视剧'。
     宽限期锚点 = max(订阅创建, 剧集首播)：提前订阅未开播剧时，保护期从开播起算，
     而不是订阅创建起算（否则剧晚于订阅 14 天以上开播会漏保护）。
+    返回 (是否过早, 判定文案, 明细 dict)；明细供详情页记录展示。
     """
     now = now or datetime.datetime.now()
+    detail: Dict[str, Any] = {}
     if media_type != "电视剧":
-        return False, "非电视剧订阅"
+        return False, "非电视剧订阅", detail
     if manual_total_episode:
-        return False, "用户手动指定总集数，不干预"
+        return False, "用户手动指定总集数，不干预", detail
     if not subscribe_created:
-        return False, "订阅创建时间缺失，保守放行"
+        return False, "订阅创建时间缺失，保守放行", detail
     anchor, anchor_src = subscribe_created, "订阅创建"
     if series_first_air_date:
         first_dt = datetime.datetime.combine(series_first_air_date, datetime.time.min)
         if first_dt > anchor:
             anchor, anchor_src = first_dt, "剧集首播"
     age_days = (now - anchor).days
+    detail.update({"anchor_src": anchor_src, "age_days": age_days,
+                   "grace_days": grace_days})
     if age_days > grace_days:
-        return False, f"{anchor_src}距今 {age_days} 天，超宽限期 {grace_days} 天"
+        return False, f"{anchor_src}距今 {age_days} 天，超宽限期 {grace_days} 天", detail
     if (tmdb_status or "").strip().lower() in FINISHED_STATUSES:
-        return False, f"TMDB 已标记完结（{tmdb_status}）"
+        detail["tmdb_status"] = tmdb_status
+        return False, f"TMDB 已标记完结（{tmdb_status}）", detail
     if latest_episode_air_date is None:
-        return False, "无最新集首播日期，保守放行"
+        return False, "无最新集首播日期，保守放行", detail
     gap = (now.date() - latest_episode_air_date).days
+    detail.update({"gap_days": gap, "recent_ep_days": recent_ep_days})
     if gap > recent_ep_days:
-        return False, f"最新集已播 {gap} 天（>{recent_ep_days}），不像仍在更新"
+        return False, f"最新集已播 {gap} 天（>{recent_ep_days}），不像仍在更新", detail
     return True, (f"{anchor_src} {age_days} 天内、TMDB 未完结、最新集 {gap} 天前刚播，"
-                  f"当前总集数可能未更新全")
+                  f"当前总集数可能未更新全"), detail
+
+
+# 判定明细中不参与"有信息量放行记录"的原因（噪声：电影/手动集数每部都命中）
+NOISE_PASS_REASONS = ("非电视剧订阅", "用户手动指定总集数，不干预")
+
+LOG_KEEP_MAX = 500
+LOG_KEEP_DAYS = 90
+
+
+def prune_guard_logs(logs: List[dict], now: Optional[datetime.datetime] = None,
+                     keep_max: int = LOG_KEEP_MAX,
+                     keep_days: int = LOG_KEEP_DAYS) -> List[dict]:
+    """日志裁剪：仅保留 keep_days 天内、最多 keep_max 条（按写入顺序尾部保留）。"""
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(days=keep_days)
+    out = []
+    for item in logs or []:
+        if not isinstance(item, dict):
+            continue
+        t = parse_dt(item.get("time"))
+        if t and t >= cutoff:
+            out.append(item)
+    return out[-keep_max:]
 
 
 def should_raise_total(*, current_total: int, covered_max: int) -> bool:
@@ -164,7 +193,7 @@ class SubscribeEpisodeGuard(_PluginBase):
     # 插件图标
     plugin_icon = "subscribe.png"
     # 插件版本
-    plugin_version = "1.0.3"
+    plugin_version = "1.1.0"
     # 插件作者
     plugin_author = "totobo"
     # 作者主页
@@ -295,6 +324,42 @@ class SubscribeEpisodeGuard(_PluginBase):
         return any(k.strip() and k.strip() in name for k in self._exclude_keywords.splitlines())
 
     # ------------------------------------------------------------------
+    # 处理记录（详情页数据源：PluginDataOper 键值存储，卸载即净）
+    # ------------------------------------------------------------------
+
+    def _append_guard_log(self, action: str, subscribe: Any = None, reason: str = "",
+                          hit: Optional[bool] = None, extra: Optional[dict] = None):
+        """追加一条处理记录；任何失败只记 debug，绝不影响守卫主流程。"""
+        try:
+            entry = {
+                "time": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "action": action,
+                "hit": hit,
+                "mode": self._mode,
+                "name": getattr(subscribe, "name", None) if subscribe is not None else None,
+                "season": getattr(subscribe, "season", None) if subscribe is not None else None,
+                "subscribe_id": getattr(subscribe, "id", None) if subscribe is not None else None,
+                "reason": reason,
+            }
+            if subscribe is not None:
+                entry["total_episode"] = getattr(subscribe, "total_episode", None)
+            if extra:
+                entry.update(extra)
+            logs = self.get_data("guard_logs") or []
+            if not isinstance(logs, list):
+                logs = []
+            logs.append(entry)
+            self.save_data("guard_logs", prune_guard_logs(logs))
+        except Exception as e:
+            logger.debug(f"[守卫] 处理记录写入失败（已忽略）：{e}")
+
+    def _guard_logs(self) -> List[dict]:
+        logs = self.get_data("guard_logs") or []
+        if not isinstance(logs, list):
+            return []
+        return logs
+
+    # ------------------------------------------------------------------
     # 实时保护·结项急刹：否决过早完成（主挂载点）
     # ------------------------------------------------------------------
 
@@ -320,11 +385,15 @@ class SubscribeEpisodeGuard(_PluginBase):
                 # TMDB 已涨集且主程序本轮会自行跟踪总集数，无需否决
                 logger.debug(f"[守卫] 《{getattr(subscribe, 'name', '?')}》TMDB 现 {tmdb_total} 集"
                              f">订阅 {getattr(subscribe, 'total_episode', 0)} 集，交主程序跟踪")
+                self._append_guard_log(
+                    "放行结项", subscribe,
+                    reason=f"TMDB 现 {tmdb_total} 集>订阅 {getattr(subscribe, 'total_episode', 0)} 集，交主程序跟踪",
+                    hit=False, extra={"tmdb_total": tmdb_total})
                 return
             # 宽限期锚点用首播日：优先本季首播（季详情 first_air_date），退剧集首播
             first_air = (parse_date((detail or {}).get("first_air_date"))
                          or parse_date((self._series_detail(tmdbid) or {}).get("first_air_date")))
-            premature, reason = is_premature_completion(
+            premature, reason, judge = is_premature_completion(
                 media_type=str(getattr(subscribe, "type", "") or ""),
                 manual_total_episode=bool(getattr(subscribe, "manual_total_episode", False)),
                 subscribe_created=parse_dt(getattr(subscribe, "date", None)),
@@ -337,16 +406,22 @@ class SubscribeEpisodeGuard(_PluginBase):
             )
             if not premature:
                 logger.debug(f"[守卫] 《{getattr(subscribe, 'name', '?')}》完成放行：{reason}")
+                if not reason.startswith(NOISE_PASS_REASONS):
+                    self._append_guard_log("放行结项", subscribe, reason=reason,
+                                           hit=False, extra=judge)
                 return
             if self._mode == "observe":
                 logger.info(f"[守卫·观察] 《{getattr(subscribe, 'name', '?')}》"
                             f"(id={getattr(subscribe, 'id', '?')}) 疑似过早完成（观察模式未否决）：{reason}")
+                self._append_guard_log("观察命中", subscribe, reason=reason,
+                                       hit=True, extra=judge)
                 return
             data.cancel = True
             data.source = PLUGIN_SOURCE
             data.reason = reason
             logger.info(f"[守卫] 已否决《{getattr(subscribe, 'name', '?')}》"
                         f"(id={getattr(subscribe, 'id', '?')}) 的提前结项：{reason}")
+            self._append_guard_log("否决结项", subscribe, reason=reason, hit=True, extra=judge)
             try:
                 self.post_message(
                     mtype=NotificationType.Subscribe,
@@ -398,6 +473,9 @@ class SubscribeEpisodeGuard(_PluginBase):
             data.source = PLUGIN_SOURCE
             logger.info(f"[守卫] precheck 抬高《{subscribe.name}》总集数 "
                         f"{data.current_total_episode} -> {data.total_episode}（宽限防误完成）")
+            self._append_guard_log("缓兵抬高", subscribe, hit=True,
+                                   reason=f"总集数 {data.current_total_episode} -> {data.total_episode}（宽限防误完成）",
+                                   extra={"anchor_age_days": (datetime.datetime.now() - anchor).days})
         except Exception as e:
             logger.warning(f"[守卫] SubscribeEpisodesRefresh 处理异常（已忽略）：{e}")
 
@@ -405,9 +483,27 @@ class SubscribeEpisodeGuard(_PluginBase):
     # 每日巡检已结项订阅
     # ------------------------------------------------------------------
 
+    def _log_sweep(self, source: str, findings: List[dict]):
+        """巡检结果落记录：1 条巡检概览 + 每缺口 1 条明细。"""
+        names = "、".join(f"《{f['name']}》" for f in findings[:5]) or "无"
+        self._append_guard_log(
+            f"{source}巡检", None,
+            hit=bool(findings),
+            reason=f"发现 {len(findings)} 个疑似提前结项：{names}" if findings else "未发现提前结项",
+            extra={"found": len(findings)})
+        for f in findings:
+            self._append_guard_log(
+                "巡检缺口", None, hit=True,
+                name=f.get("name"), season=f.get("season"),
+                reason=f"结项时 {f['old_total']} 集 → TMDB 现 {f['new_total']} 集，"
+                       f"缺 {len(f['missing'])} 集",
+                extra={"old_total": f["old_total"], "new_total": f["new_total"],
+                       "missing_count": len(f["missing"])})
+
     def _sweep_job(self):
         try:
             findings = self.sweep_once(now=datetime.datetime.now())
+            self._log_sweep("每日", findings)
         except Exception as e:
             logger.warning(f"[守卫·巡检] 异常（已忽略）：{e}")
             return
@@ -506,6 +602,11 @@ class SubscribeEpisodeGuard(_PluginBase):
                 note=f"{PLUGIN_SOURCE} 自动复活",
             )
             logger.info(f"[守卫·巡检] 《{f['name']}》已复活订阅 id={subscribeid} msg={msg}")
+            if subscribeid:
+                self._append_guard_log("自动复活", None, hit=True,
+                                       name=f.get("name"), season=f.get("season"),
+                                       subscribe_id=subscribeid,
+                                       reason=f"重建订阅 id={subscribeid}")
         except Exception as e:
             logger.warning(f"[守卫·巡检] 复活《{f['name']}》失败：{e}")
 
@@ -513,11 +614,111 @@ class SubscribeEpisodeGuard(_PluginBase):
     # 配置面板 / 命令
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _action_color(action: str, hit: Optional[bool]) -> str:
+        if action == "否决结项":
+            return "error"
+        if action == "观察命中":
+            return "warning"
+        if action == "缓兵抬高":
+            return "info"
+        if action in ("巡检缺口", "每日巡检", "手动巡检") and hit:
+            return "warning"
+        if action == "自动复活":
+            return "success"
+        return "grey"
+
+    def _guard_stats(self, logs: List[dict]) -> Dict[str, int]:
+        today = datetime.date.today().strftime("%Y-%m-%d")
+        stats = {"veto_today": 0, "observe_pending": 0, "gap_recent": 0}
+        for item in logs:
+            t = str(item.get("time") or "")
+            action = item.get("action")
+            if action == "否决结项" and t.startswith(today):
+                stats["veto_today"] += 1
+            elif action == "观察命中":
+                stats["observe_pending"] += 1
+            elif action == "巡检缺口":
+                stats["gap_recent"] += 1
+        return stats
+
     def get_page(self) -> List[dict]:
-        """插件详情页：展示最近一次巡检结果。"""
-        if not self._last_manual_report:
-            return []
-        return [
+        """插件详情页：运行状态 + 统计 + 守卫处理记录（时间倒序）。"""
+        logs = self._guard_logs()
+        # 状态徽标
+        if not self._enabled:
+            state_badge, state_color = "● 未启用", "grey"
+        elif self._mode == "observe":
+            state_badge, state_color = f"◐ 观察模式（{self._intervention_text()}）", "warning"
+        else:
+            state_badge, state_color = f"● 生效模式（{self._intervention_text()}）", "success"
+        stats = self._guard_stats(logs)
+
+        def stat_card(title: str, value: int, color: str):
+            return {
+                'component': 'VCard',
+                'props': {'variant': 'tonal', 'color': color, 'class': 'pa-3', 'flat': True},
+                'content': [
+                    {'component': 'div', 'text': title,
+                     'props': {'class': 'text-caption'}},
+                    {'component': 'div', 'text': str(value),
+                     'props': {'class': 'text-h5 font-weight-bold'}}
+                ]
+            }
+
+        rows = []
+        for item in sorted(logs, key=lambda x: x.get("time") or "", reverse=True)[:100]:
+            color = self._action_color(item.get("action") or "", item.get("hit"))
+            cells = []
+            for text, cls in (
+                    (str(item.get("time") or ""), 'whitespace-nowrap break-keep text-high-emphasis'),
+                    (f"《{item.get('name')}》S{item.get('season')}" if item.get("name") else "—", ''),
+                    (str(item.get("action") or ""), f'--v-{color} text-{color} font-weight-medium'),
+                    (f"订阅 {item.get('total_episode')} 集" if item.get("total_episode") else "—", ''),
+                    (str(item.get("reason") or ""), ''),
+            ):
+                cells.append({
+                    'component': 'td',
+                    'props': {'class': f'text-sm ps-4 {cls}'.strip()},
+                    'text': text
+                })
+            rows.append({'component': 'tr', 'props': {'class': 'text-sm'}, 'content': cells})
+
+        if rows:
+            table_content = [
+                {
+                    'component': 'thead',
+                    'content': [
+                        {'component': 'th', 'props': {'class': 'text-start ps-4'}, 'text': col}
+                        for col in ("时间", "订阅", "动作", "当时总集数", "判定/详情")
+                    ]
+                },
+                {'component': 'tbody', 'content': rows}
+            ]
+        else:
+            table_content = []
+
+        page = [
+            {
+                'component': 'VRow',
+                'content': [
+                    {
+                        'component': 'VCol',
+                        'props': {'cols': 12, 'md': 3},
+                        'content': [
+                            {'component': 'VAlert', 'props': {
+                                'type': state_color, 'variant': 'tonal', 'density': 'compact'},
+                             'text': state_badge}
+                        ]
+                    },
+                    {'component': 'VCol', 'props': {'cols': 4, 'md': 3},
+                     'content': [stat_card("今日拦截", stats["veto_today"], "error")]},
+                    {'component': 'VCol', 'props': {'cols': 4, 'md': 3},
+                     'content': [stat_card("观察待确认", stats["observe_pending"], "warning")]},
+                    {'component': 'VCol', 'props': {'cols': 4, 'md': 3},
+                     'content': [stat_card("近期巡检缺口", stats["gap_recent"], "info")]},
+                ]
+            },
             {
                 'component': 'VRow',
                 'content': [
@@ -526,15 +727,49 @@ class SubscribeEpisodeGuard(_PluginBase):
                         'props': {'cols': 12},
                         'content': [
                             {
-                                'component': 'VAlert',
-                                'props': {'type': 'info', 'variant': 'tonal'},
-                                'text': self._last_manual_report
+                                'component': 'VTable',
+                                'props': {'hover': True},
+                                'content': table_content or [
+                                    {'component': 'tbody', 'content': [
+                                        {'component': 'tr', 'content': [
+                                            {'component': 'td',
+                                             'props': {'class': 'text-center py-8 text-medium-emphasis'},
+                                             'text': '暂无处理记录（守卫尚无结项判定/巡检动作）'}
+                                        ]}
+                                    ]}
+                                ]
                             }
+                        ]
+                    }
+                ]
+            },
+            {
+                'component': 'VRow',
+                'content': [
+                    {
+                        'component': 'VCol',
+                        'props': {'cols': 12},
+                        'content': [
+                            {'component': 'VAlert', 'props': {
+                                'type': 'info', 'variant': 'text', 'density': 'compact'},
+                             'text': f"记录保留最近 {LOG_KEEP_DAYS} 天、最多 {LOG_KEEP_MAX} 条。"
+                                     f"观察模式下\"观察命中\"= 本该拦截但未干预，确认无误后到配置切生效模式。"
+                                     + (f" 上次巡检输出：{self._last_manual_report}" if self._last_manual_report else "")}
                         ]
                     }
                 ]
             }
         ]
+        return page
+
+    def _intervention_text(self) -> str:
+        if self._enable_completion_veto and self._enable_refresh_raise:
+            return "急刹+缓兵"
+        if self._enable_completion_veto:
+            return "结项急刹"
+        if self._enable_refresh_raise:
+            return "集数缓兵"
+        return "仅每日巡检"
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
         return [
@@ -709,7 +944,23 @@ class SubscribeEpisodeGuard(_PluginBase):
         ]
 
     def get_api(self) -> List[Dict[str, Any]]:
-        return []
+        return [
+            {
+                "path": "/logs",
+                "endpoint": self.get_logs_api,
+                "methods": ["GET"],
+                "auth": "bear",
+                "summary": "获取订阅集数守卫处理记录（可选 limit，默认 100）",
+            },
+        ]
+
+    def get_logs_api(self, limit: int = 100):
+        try:
+            limit = max(1, min(int(limit or 100), LOG_KEEP_MAX))
+        except (TypeError, ValueError):
+            limit = 100
+        logs = sorted(self._guard_logs(), key=lambda x: x.get("time") or "", reverse=True)
+        return {"count": len(logs), "logs": logs[:limit]}
 
     @eventmanager.register(EventType.PluginAction)
     def handle_command(self, event: Event):
@@ -722,6 +973,7 @@ class SubscribeEpisodeGuard(_PluginBase):
             channel = event_data.get("channel")
             username = event_data.get("username") or self._notify_user or None
             findings = self.sweep_once()
+            self._log_sweep("手动", findings)
             if not findings:
                 self.put_message(channel=channel, title="订阅守卫",
                                  text="手动巡检完成：未发现提前结项的订阅。",
