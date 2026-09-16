@@ -108,6 +108,29 @@ class TestPremature(unittest.TestCase):
         stale = datetime.date(2026, 8, 1)  # 37 天前
         self.assertFalse(self._call(latest_episode_air_date=stale)[0])
 
+    def test_presubscribe_late_premiere(self):
+        """提前 2 个月订阅未开播剧，开播 5 天后误结项：首播日锚点须命中。"""
+        created = self.NOW - datetime.timedelta(days=65)   # 订阅很老
+        first_air = datetime.date(2026, 9, 2)              # 5 天前才开播
+        hit, reason = self._call(subscribe_created=created,
+                                 series_first_air_date=first_air,
+                                 latest_episode_air_date=datetime.date(2026, 9, 6))
+        self.assertTrue(hit)
+        self.assertIn("剧集首播", reason)
+
+    def test_presubscribe_old_series_still_expired(self):
+        """订阅老且剧首播也老（无首播日时退回订阅创建锚点）：仍超宽限放行。"""
+        created = self.NOW - datetime.timedelta(days=65)
+        hit, reason = self._call(subscribe_created=created)  # 不传首播日
+        self.assertFalse(hit)
+        self.assertIn("订阅创建", reason)
+
+    def test_first_air_earlier_than_subscribe(self):
+        """老剧新订阅：首播日早于创建，锚点取创建时间，正常保护。"""
+        hit, reason = self._call(series_first_air_date=datetime.date(2026, 1, 1))
+        self.assertTrue(hit)
+        self.assertIn("订阅创建", reason)
+
 
 class TestRaise(unittest.TestCase):
     def test_at_boundary(self):

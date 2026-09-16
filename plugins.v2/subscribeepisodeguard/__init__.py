@@ -111,12 +111,15 @@ def is_premature_completion(*,
                             subscribe_created: Optional[datetime.datetime],
                             tmdb_status: Optional[str],
                             latest_episode_air_date: Optional[datetime.date],
+                            series_first_air_date: Optional[datetime.date] = None,
                             now: Optional[datetime.datetime] = None,
                             grace_days: int = 14,
                             recent_ep_days: int = 21) -> Tuple[bool, str]:
     """
     是否疑似"过早完成"。全部条件满足才 True；任一不满足保守放行结项。
     media_type 与 Subscribe.type 存值一致，电视剧为 '电视剧'。
+    宽限期锚点 = max(订阅创建, 剧集首播)：提前订阅未开播剧时，保护期从开播起算，
+    而不是订阅创建起算（否则剧晚于订阅 14 天以上开播会漏保护）。
     """
     now = now or datetime.datetime.now()
     if media_type != "电视剧":
@@ -125,9 +128,14 @@ def is_premature_completion(*,
         return False, "用户手动指定总集数，不干预"
     if not subscribe_created:
         return False, "订阅创建时间缺失，保守放行"
-    age_days = (now - subscribe_created).days
+    anchor, anchor_src = subscribe_created, "订阅创建"
+    if series_first_air_date:
+        first_dt = datetime.datetime.combine(series_first_air_date, datetime.time.min)
+        if first_dt > anchor:
+            anchor, anchor_src = first_dt, "剧集首播"
+    age_days = (now - anchor).days
     if age_days > grace_days:
-        return False, f"订阅已创建 {age_days} 天，超宽限期 {grace_days} 天"
+        return False, f"{anchor_src}距今 {age_days} 天，超宽限期 {grace_days} 天"
     if (tmdb_status or "").strip().lower() in FINISHED_STATUSES:
         return False, f"TMDB 已标记完结（{tmdb_status}）"
     if latest_episode_air_date is None:
@@ -135,7 +143,7 @@ def is_premature_completion(*,
     gap = (now.date() - latest_episode_air_date).days
     if gap > recent_ep_days:
         return False, f"最新集已播 {gap} 天（>{recent_ep_days}），不像仍在更新"
-    return True, (f"订阅创建 {age_days} 天内、TMDB 未完结、最新集 {gap} 天前刚播，"
+    return True, (f"{anchor_src} {age_days} 天内、TMDB 未完结、最新集 {gap} 天前刚播，"
                   f"当前总集数可能未更新全")
 
 
@@ -156,7 +164,7 @@ class SubscribeEpisodeGuard(_PluginBase):
     # 插件图标
     plugin_icon = "subscribe.png"
     # 插件版本
-    plugin_version = "1.0.2"
+    plugin_version = "1.0.3"
     # 插件作者
     plugin_author = "totobo"
     # 作者主页
@@ -259,7 +267,7 @@ class SubscribeEpisodeGuard(_PluginBase):
             logger.debug(f"订阅集数守卫：TMDB 季详情失败 tmdb={tmdbid} S{season}: {e}")
             return None
 
-    def _series_status(self, tmdbid: Optional[int]) -> Optional[str]:
+    def _series_detail(self, tmdbid: Optional[int]) -> Optional[dict]:
         if not tmdbid:
             return None
         tmdb = self._tmdb()
@@ -267,9 +275,12 @@ class SubscribeEpisodeGuard(_PluginBase):
             return None
         try:
             info = tmdb.tmdb_info(tmdbid=tmdbid, mtype=MediaType.TV)
-            return (info or {}).get("status")
+            return info if isinstance(info, dict) else None
         except Exception:
             return None
+
+    def _series_status(self, tmdbid: Optional[int]) -> Optional[str]:
+        return (self._series_detail(tmdbid) or {}).get("status")
 
     @staticmethod
     def _latest_air_date(season_detail: Optional[dict]) -> Optional[datetime.date]:
@@ -310,6 +321,9 @@ class SubscribeEpisodeGuard(_PluginBase):
                 logger.debug(f"[守卫] 《{getattr(subscribe, 'name', '?')}》TMDB 现 {tmdb_total} 集"
                              f">订阅 {getattr(subscribe, 'total_episode', 0)} 集，交主程序跟踪")
                 return
+            # 宽限期锚点用首播日：优先本季首播（季详情 first_air_date），退剧集首播
+            first_air = (parse_date((detail or {}).get("first_air_date"))
+                         or parse_date((self._series_detail(tmdbid) or {}).get("first_air_date")))
             premature, reason = is_premature_completion(
                 media_type=str(getattr(subscribe, "type", "") or ""),
                 manual_total_episode=bool(getattr(subscribe, "manual_total_episode", False)),
@@ -317,6 +331,7 @@ class SubscribeEpisodeGuard(_PluginBase):
                 tmdb_status=self._series_status(tmdbid)
                             or (getattr(mediainfo, "status", None) if mediainfo else None),
                 latest_episode_air_date=self._latest_air_date(detail),
+                series_first_air_date=first_air,
                 grace_days=self._grace_days,
                 recent_ep_days=self._recent_ep_days,
             )
@@ -368,7 +383,15 @@ class SubscribeEpisodeGuard(_PluginBase):
                                       covered_max=covered_max_episode(subscribe)):
                 return
             created = parse_dt(getattr(subscribe, "date", None))
-            if not created or (datetime.datetime.now() - created).days > self._grace_days:
+            if not created:
+                return
+            # 宽限期锚点与结项急刹一致：max(订阅创建, 剧集首播)
+            anchor = created
+            first_air = parse_date((self._series_detail(getattr(subscribe, "tmdbid", None)) or {}).get("first_air_date"))
+            if first_air:
+                first_dt = datetime.datetime.combine(first_air, datetime.time.min)
+                anchor = max(anchor, first_dt)
+            if (datetime.datetime.now() - anchor).days > self._grace_days:
                 return
             data.updated = True
             data.total_episode = data.current_total_episode + 1
@@ -595,7 +618,8 @@ class SubscribeEpisodeGuard(_PluginBase):
                                 'content': [
                                     {'component': 'VTextField', 'props': {
                                         'model': 'grace_days', 'label': '宽限期（天）',
-                                        'type': 'number'}}
+                                        'type': 'number',
+                                        'hint': '从 max(订阅创建, 剧集首播) 起算的保护期'}}
                                 ]
                             },
                             {
