@@ -1,7 +1,7 @@
 import json
 import re
 import time
-from typing import Any, List, Dict, Tuple
+from typing import Any, List, Dict, Optional, Tuple
 
 from app.core.event import eventmanager, Event
 from app.db.downloadhistory_oper import DownloadHistoryOper
@@ -12,15 +12,120 @@ from app.plugins import _PluginBase
 from app.schemas.types import EventType, SystemConfigKey, MediaType
 
 
+# ---------------------------------------------------------------------------
+# 识别词还原纯函数（无 MP 运行时依赖，可独立单测）
+# 背景：_meta.customization 是从"识别词替换后"的文本抠出的占位符（如 60帧），
+# 而订阅 include 规则匹配的是种子"原始标题"（60FPS）。直接拼替换后文本会死规则。
+# 路线① apply_words/词表反查：词目 RHS 字面 → LHS 正则回搜原始标题还原片段；
+# 路线② 锚点差分：token 在替换后文本中的前后锚点 → 原始标题对应区间；
+# 任何还原结果最终仍须过调用方的"原始标题自匹配闸门"，错误只会降级不会写死。
+# ---------------------------------------------------------------------------
+
+_REPLACE_SEP = " => "
+# 替换词为纯字面才可反演（含正则元字符的 RHS 跳过）
+_LITERAL_RE = re.compile(r"^[A-Za-z0-9\u4e00-\u9fff .]+$")
+
+
+def parse_replace_pairs(words: List[str]) -> List[Tuple[str, str]]:
+    """从识别词配置/apply_words 提取简单替换对 (LHS正则串, RHS字面)。"""
+    pairs = []
+    for w in words or []:
+        if not isinstance(w, str) or w.startswith("#") or _REPLACE_SEP not in w:
+            continue
+        lhs, _, rhs = w.partition(_REPLACE_SEP)
+        lhs, rhs = lhs.strip(), rhs.strip()
+        # 复合词（含 && <> >>）跳过，防误解析
+        if not lhs or not rhs or " && " in w or " <> " in w or " >> " in w:
+            continue
+        if not _LITERAL_RE.match(rhs):
+            continue
+        pairs.append((lhs, rhs))
+    return pairs
+
+
+def restore_customization_token(token: str, replaced_title: str,
+                                raw_title: str,
+                                pairs: List[Tuple[str, str]]) -> Optional[str]:
+    """
+    把替换后文本里抠出的占位符 token（如 '60帧'）还原为原始标题里的对应片段
+    （如 '60FPS'）。还原不了返回 None（由调用方降级）。
+    """
+    if not token or not raw_title:
+        return None
+    # 已经是原文一部分：直接用（大小写不敏感匹配，字面即安全）
+    if re.search(re.escape(token), raw_title, re.IGNORECASE):
+        return token
+    # 路线①：RHS 字面命中 token 的某段 → 用 LHS 正则回搜原始标题重建该段
+    for lhs, rhs in pairs or []:
+        try:
+            pos = token.lower().find(rhs.lower())
+            if pos < 0:
+                continue
+            m = re.search(lhs, raw_title, re.IGNORECASE)
+            if not m:
+                continue
+            cand = token[:pos] + m.group(0) + token[pos + len(rhs):]
+            if re.search(re.escape(cand), raw_title, re.IGNORECASE):
+                return cand
+        except re.error:
+            continue
+    # 路线②：锚点差分——token 在替换后文本中的左右邻接字串当锚，
+    # 在原始标题里锚住中间捕获的就是原始片段（对多词连锁替换同样有效）。
+    # 前提：词表中存在 RHS 是 token 的子串——证明该位置确实发生过替换，
+    # 无此证据时不臆测（防止 replaced/raw 文本不同源时把无关片段当还原）。
+    has_replace_evidence = any(rhs and rhs.lower() in token.lower()
+                               for _, rhs in pairs or [])
+    if replaced_title and has_replace_evidence:
+        try:
+            i = replaced_title.lower().find(token.lower())
+        except Exception:
+            i = -1
+        if i >= 0:
+            prefix = replaced_title[max(0, i - 8):i]
+            suffix = replaced_title[i + len(token):i + len(token) + 8]
+            if prefix or suffix:
+                try:
+                    anchor_pat = re.compile(
+                        re.escape(prefix) + r"(.{1,40}?)" + re.escape(suffix),
+                        re.IGNORECASE)
+                    m = anchor_pat.search(raw_title)
+                    if m:
+                        cand = m.group(1).strip()
+                        # 长度合理性：替换词与原文片段信息量相近，捕获远超 token
+                        # 说明锚点在原始标题里对不齐（排版差异），拒绝假还原
+                        if cand and len(cand) <= max(2 * len(token) + 8, 24):
+                            return cand
+                except re.error:
+                    pass
+    return None
+
+
+def build_include_rule(fragments: List[str]) -> Optional[str]:
+    """
+    多片段 → 同现断言 (?=.*A)(?=.*B)（只要求同现不限词序，过滤器忽略大小写）。
+    单片段直接用字面（与上游行为一致）。全部 re.escape，宁缺毋滥返回 None。
+    """
+    frags = [f for f in fragments if f]
+    if not frags:
+        return None
+    try:
+        escaped = [re.escape(f) for f in frags]
+    except re.error:
+        return None
+    if len(escaped) == 1:
+        return escaped[0]
+    return "".join(f"(?=.*{e})" for e in escaped)
+
+
 class SubscribeGroupFix(_PluginBase):
     # 插件名称
     plugin_name = "订阅规则自动填充(修复版)"
     # 插件描述
-    plugin_desc = "基于 thsrite SubscribeGroup v2.8.7 二开修复：制作组固化改用原始种子名自匹配校验，杜绝识别词替换文本导致的死规则；多季剧固化去重按季区分。"
+    plugin_desc = "基于 thsrite SubscribeGroup v2.8.7 二开修复：固化 include 先把识别词替换文本还原为种子原始片段（词表反查+锚点差分）再拼同现断言规则，自匹配校验杜绝死规则；多季剧固化去重按季区分。"
     # 插件图标
     plugin_icon = "teamwork.png"
     # 插件版本
-    plugin_version = "2.8.7-fix.2"
+    plugin_version = "2.8.7-fix.3"
     # 插件作者
     plugin_author = "totobo"
     # 作者主页
@@ -323,18 +428,34 @@ class SubscribeGroupFix(_PluginBase):
                     # 官组
                     resource_team = _meta.resource_team if _meta else None
                     customization = _meta.customization if _meta else None
-                    # [FIX subscribegroupfix] 上游直接使用识别词替换后的 customization（如中文"60帧"）
-                    # 拼 include 正则，而订阅过滤是对种子原始标题做正则匹配，两侧文本错位，
-                    # 生成的规则可能永不命中（死规则）导致订阅静默停摆。
-                    # 修复：拼装出的候选正则先用"原始种子标题"自匹配校验，不通过则降级为仅制作组。
-                    candidate = None
-                    if resource_team and customization:
-                        candidate = f"{customization}.+{resource_team}"
-                    if not candidate and (customization or resource_team):
-                        candidate = customization or resource_team
+                    raw_title = _torrent.title if _torrent else None
+                    # [FIX subscribegroupfix v2.8.7-fix.3] customization 是识别词替换后文本抠出的
+                    # 占位符（如"60帧"），规则匹配的却是种子原始标题（60FPS）。先尝试把 token
+                    # 还原为原始片段（① apply_words/词表反查，② 锚点差分），再以"同现断言"
+                    # 拼规则（不限词序）；最终仍过原始标题自匹配闸门，还原失败则降级为制作组。
+                    fragments: List[str] = []
+                    if customization:
+                        tokens = [t for t in customization.split("@") if t]
+                        if tokens and raw_title:
+                            try:
+                                pairs = parse_replace_pairs(
+                                    (getattr(_meta, "apply_words", None) or [])
+                                    + (self.systemconfig.get(SystemConfigKey.CustomIdentifiers) or []))
+                            except Exception:
+                                pairs = []
+                            replaced_text = getattr(_meta, "org_string", None) or ""
+                            for tk in tokens:
+                                restored = restore_customization_token(
+                                    tk, replaced_text, raw_title, pairs)
+                                if restored:
+                                    fragments.append(restored)
+                                else:
+                                    logger.info(f"订阅记录:{subscribe.name} 占位符 {tk} 无法还原为原始文本，将降级")
+                    if resource_team:
+                        fragments.append(resource_team)
+                    candidate = build_include_rule(fragments)
                     if candidate:
-                        raw_title = _torrent.title if _torrent else None
-                        # candidate 本身是正则（含.+等），用 re.search 校验；非法正则同样降级
+                        # candidate 本身是正则，用 re.search 校验；非法正则同样降级
                         try:
                             if raw_title and re.search(candidate, raw_title, re.IGNORECASE):
                                 update_dict['include'] = candidate
