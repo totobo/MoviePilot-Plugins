@@ -20,9 +20,9 @@ class SubscribeGroupFix(_PluginBase):
     # 插件图标
     plugin_icon = "teamwork.png"
     # 插件版本
-    plugin_version = "2.8.7-fix.1"
+    plugin_version = "2.8.7-fix.2"
     # 插件作者
-    plugin_author = "totobo（原插件作者 thsrite）"
+    plugin_author = "totobo"
     # 作者主页
     author_url = "https://github.com/totobo/MoviePilot-Plugins"
     # 插件配置项ID前缀
