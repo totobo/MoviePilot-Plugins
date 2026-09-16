@@ -13,10 +13,10 @@ https://github.com/totobo/MoviePilot-Plugins
 解决：**周更剧刚开播时 TMDB 季集数不全，订阅按旧集数下完即被误判"完成"结项，
 之后 TMDB 涨集数但已完成订阅无复活机制，缺集永远漏追。**
 
-- B 主防线：挂官方链事件 `SubscribeCompletionCheck`（结项前一票否决）与
-  `SubscribeEpisodesRefresh`（precheck +1 兜底），命中"疑似过早完成"规则时阻止结项，
-  订阅继续存活等 TMDB 追平；
-- C 保险丝：每日 09:30 巡检近 N 天已结项电视剧订阅，比对 TMDB 当前集数，
+- 实时保护（默认开"结项急刹"）：MP 结项前一票否决（挂官方事件 `SubscribeCompletionCheck`），
+  命中"疑似过早完成"规则时阻止结项，订阅继续存活等 TMDB 追平；另有可选的
+  "集数缓兵"（`SubscribeEpisodesRefresh` 完成判定前 +1 拖住）；
+- 每日巡检：每日 09:30 回扫近 N 天已结项电视剧订阅，比对 TMDB 当前集数，
   集数上涨仍有缺口 → 通知，可选自动重新订阅；
 - 默认**观察模式**（只记日志不干预），确认判定无误后在配置里切生效模式；
 - 保守判定：仅电视剧、非手动集数、宽限期内、TMDB 未完结、最新集在播窗口内才拦截；

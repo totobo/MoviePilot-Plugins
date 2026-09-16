@@ -5,12 +5,12 @@ SubscribeEpisodeGuard（订阅集数守卫）v1.0.0
      结项（写历史+删订阅）；之后 TMDB 涨集数，已完成订阅没有复活机制，缺集无人追。
 
 双保险：
-  B 主防线（实时，仅使用官方链事件扩展口，不 monkey-patch 主程序）：
-    B-1 SubscribeCompletionCheck：订阅结项前一票否决（cancel=True），命中
+  实时保护（仅使用官方链事件扩展口，不 monkey-patch 主程序）：
+    结项急刹 SubscribeCompletionCheck：订阅结项前一票否决（cancel=True），命中
         "疑似过早完成"规则时阻止结项，订阅继续存活等 TMDB 追平。
-    B-2 SubscribeEpisodesRefresh(scene=precheck)：完成判定前 total_episode +1
-        兜底抬高（默认关闭，与 B-1 二选一）。
-  C 保险丝（官方 get_service 注册的每日 cron）：
+    集数缓兵 SubscribeEpisodesRefresh(scene=precheck)：完成判定前 total_episode +1
+        兜底抬高（默认关闭，与结项急刹二选一）。
+  每日巡检（官方 get_service 注册的每日 cron）：
     扫近 N 天已完成的电视剧订阅历史，比对 TMDB 当前季集数：上涨且仍有缺口
     → 通知；auto_resubscribe=true 时自动重建订阅（默认关）。
 
@@ -156,7 +156,7 @@ class SubscribeEpisodeGuard(_PluginBase):
     # 插件图标
     plugin_icon = "subscribe.png"
     # 插件版本
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     # 插件作者
     plugin_author = "totobo"
     # 作者主页
@@ -198,7 +198,7 @@ class SubscribeEpisodeGuard(_PluginBase):
             self._sweep_days = max(1, int(config.get("sweep_days") or 30))
         except (TypeError, ValueError):
             pass
-        # B 层干预方式：veto / raise / both / none（默认 veto）
+        # 实时保护方式：veto 结项急刹 / raise 集数缓兵 / both / none（默认 veto）
         intervention = (config.get("intervention") or "veto").strip().lower()
         if intervention not in ("veto", "raise", "both", "none"):
             intervention = "veto"
@@ -284,7 +284,7 @@ class SubscribeEpisodeGuard(_PluginBase):
         return any(k.strip() and k.strip() in name for k in self._exclude_keywords.splitlines())
 
     # ------------------------------------------------------------------
-    # B-1 否决过早完成（主挂载点）
+    # 实时保护·结项急刹：否决过早完成（主挂载点）
     # ------------------------------------------------------------------
 
     @eventmanager.register(ChainEventType.SubscribeCompletionCheck)
@@ -345,7 +345,7 @@ class SubscribeEpisodeGuard(_PluginBase):
             logger.warning(f"[守卫] SubscribeCompletionCheck 处理异常（已忽略）：{e}")
 
     # ------------------------------------------------------------------
-    # B-2 precheck +1 抬高（兜底挂载点，默认关）
+    # 实时保护·集数缓兵：precheck +1 抬高（兜底挂载点，默认关）
     # ------------------------------------------------------------------
 
     @eventmanager.register(ChainEventType.SubscribeEpisodesRefresh)
@@ -379,7 +379,7 @@ class SubscribeEpisodeGuard(_PluginBase):
             logger.warning(f"[守卫] SubscribeEpisodesRefresh 处理异常（已忽略）：{e}")
 
     # ------------------------------------------------------------------
-    # C 每日巡检已结项订阅
+    # 每日巡检已结项订阅
     # ------------------------------------------------------------------
 
     def _sweep_job(self):
@@ -574,12 +574,12 @@ class SubscribeEpisodeGuard(_PluginBase):
                                 'content': [
                                     {'component': 'VSelect', 'props': {
                                         'model': 'intervention',
-                                        'label': 'B 层干预方式',
+                                        'label': '实时保护方式',
                                         'items': [
-                                            {'title': '完成否决（推荐）', 'value': 'veto'},
-                                            {'title': 'precheck +1 兜底', 'value': 'raise'},
-                                            {'title': '两者都开', 'value': 'both'},
-                                            {'title': '都不开（只巡检）', 'value': 'none'},
+                                            {'title': '结项急刹（推荐：结项前一票否决）', 'value': 'veto'},
+                                            {'title': '集数缓兵（完成判定前 +1 拖住）', 'value': 'raise'},
+                                            {'title': '双保险（急刹+缓兵）', 'value': 'both'},
+                                            {'title': '关闭实时保护（仅每日巡检）', 'value': 'none'},
                                         ],
                                         'persistent-hint': True}}
                                 ]
@@ -651,8 +651,8 @@ class SubscribeEpisodeGuard(_PluginBase):
                                     {'component': 'VAlert', 'props': {
                                         'type': 'info', 'variant': 'text',
                                         'text': '原理：周更剧刚开播时 TMDB 季集数常不全，订阅按旧集数下完即误结项。'
-                                                'B 层在完成判定前识别疑似过早完成并阻止结项；C 层每日回扫已结项订阅，'
-                                                '集数上涨仍有缺口的通知/自动复活。要求 MP >= v2.15.0。'
+                                                '实时保护：在结项前识别疑似过早完成并阻止，订阅继续追更；'
+                                                '每日巡检：回扫已结项订阅，集数上涨仍有缺口的通知/自动复活。要求 MP >= v2.15.0。'
                                                 '立即巡检命令：/guardrun'}}
                                 ]
                             }
