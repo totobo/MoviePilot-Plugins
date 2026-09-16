@@ -1,0 +1,14 @@
+{
+  "plugin": "SubscribeEpisodeGuard",
+  "name": "订阅集数守卫",
+  "description": "防止周更剧因 TMDB 集数滞后被订阅提前结项：否决过早完成 + 每日巡检已结项订阅，告警/自动复活。",
+  "version": "1.0.0",
+  "image": "",
+  "author": "totobo",
+  "author_url": "https://github.com/totobo/MoviePilot-Plugins",
+  "publisher": "totobo",
+  "type": "工具",
+  "other_rules": {
+    "moviepilot_version": "v2.15.4"
+  }
+}
